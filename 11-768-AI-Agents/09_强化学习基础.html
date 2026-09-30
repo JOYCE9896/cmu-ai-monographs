@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>第九讲：Agent 强化学习基础 | CMU 11-768 课程笔记</title>
+    <link rel="stylesheet" href="tufte.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body, {delimiters: [{left: '$$', right: '$$', display: true}, {left: '$', right: '$', display: false}]});"></script>
+</head>
+<body>
+
+<nav class="top-nav">
+    <a href="08_监督微调SFT.html">&larr; 上一讲</a>
+    <span>CMU 11-768: Lecture 09</span>
+    <a href="10_深度研究Agent.html">下一讲 &rarr;</a>
+</nav>
+
+<article>
+    <header>
+        <h1>第九讲：Agent 强化学习基础</h1>
+        <p class="subtitle">从 SFT 到策略梯度：专家迭代、REINFORCE、基线与优势、GRPO 和 DrGRPO</p>
+        <div class="author-meta">
+            主讲：Daniel Fried · 2026 年 9 月 22 日<br>
+            资料来源：<a href="https://www.cmu-agents.com/slides/lecture-09-rl-basics.pdf" target="_blank">课程幻灯片</a> · <a href="https://www.youtube.com/watch?v=paAcPaaYZGM" target="_blank">课堂录像</a>
+        </div>
+    </header>
+
+    <section>
+        <h2>一、贯穿全讲的例子：猜数字</h2>
+        <p>
+            一个 1 到 16 之间的整数被藏起来，Agent 有 4 次猜测机会。猜错时环境回复"更大"或"更小"，猜中才得 1 分。这次藏的数是 11。四条样本轨迹：
+        </p>
+        <table>
+            <tr><th>轨迹</th><th>过程</th><th>奖励</th></tr>
+            <tr><td>τ₁</td><td>8 更大，12 更小，10 更大，11 正确</td><td>1</td></tr>
+            <tr><td>τ₂</td><td>4 更大，8 更大，12 更小，11 正确</td><td>1</td></tr>
+            <tr><td>τ₃</td><td>16 更小，8 更大，9 更大，10 超时</td><td>0</td></tr>
+            <tr><td>τ₄</td><td>1 更大，2 更大，3 更大，4 超时</td><td>0</td></tr>
+        </table>
+        <p>
+            τ₁ 和 τ₂ 的动作不同，结果都成功。这个简单例子足以说明 SFT 的局限，以及强化学习怎样解决它们。
+        </p>
+    </section>
+
+    <section>
+        <h2>二、SFT 的三个问题</h2>
+        <p>
+            SFT 训练 Agent 最大化示范中每个目标动作的概率。以 τ₁ 为示范：历史 h₀ 是提示，目标是猜 8；h₁ 加上"更大"，目标是猜 12；依此类推。损失是：
+        </p>
+        $$\mathcal{L}_{SFT} = -\sum_t \log \pi_\theta(a_t^* \mid h_{1:t})$$
+        <p>
+            目标动作可以来自人、更强的模型，或者（本讲会讲到）这个 Agent 自己的一条成功轨迹。它有三个问题：
+        </p>
+        <ul>
+            <li>任务错位：SFT 最大化示范动作的概率，而我们真正想要的是 Agent 完成任务的概率，两者不完全相同。完成任务的方式不止一种（τ₁ 和 τ₂ 都成功）；有些动作比其他动作更差，比如在"12 → 更小"之后永远不该猜 13。</li>
+            <li>数据错位：我们希望也能从不理想的数据中学习。τ₃ 和 τ₄ 失败了，但它们也包含信息。</li>
+            <li>暴露偏差：训练时 Agent 从没见过自己的错误。示范里第一步猜 8 之后一切顺利；生成时如果第一步猜错了，它就不知道该怎么办了。</li>
+        </ul>
+        <p>
+            强化学习的思路是：让 Agent 自己生成动作和轨迹，评估奖励，调整参数以最大化期望奖励。这正好对应三个问题：目标就是期望奖励，解决任务错位；Agent 可以从所有轨迹中学习，追求高奖励、避开低奖励，解决数据错位；训练时的轨迹由 Agent 自己生成（称为 on-policy，在线策略），它能学会从自己的错误中恢复，解决暴露偏差。这个框架参考了 Sean Welleck 的 RL 基础讲义。
+        </p>
+    </section>
+
+    <section>
+        <h2>三、把交互写成轨迹</h2>
+
+        <h3>1. Agent 与环境的循环</h3>
+        <p>
+            Agent 的策略 $\pi_\theta$ 输出动作 $a_t$，环境返回观测 $o_{t+1}$ 和奖励 $r_{t+1}$。不同场景下各项的含义：
+        </p>
+        <table>
+            <tr><th></th><th>任务实例 x</th><th>观测 o</th><th>动作 a</th><th>奖励 r</th></tr>
+            <tr><td>文本生成</td><td>提示</td><td>到目前为止的 token</td><td>下一个 token</td><td>裁判模型的打分</td></tr>
+            <tr><td>网页 Agent</td><td>任务和网站</td><td>渲染的页面</td><td>点击、输入、滚动</td><td>完成的子任务数</td></tr>
+            <tr><td>猜数字</td><td>隐藏的数字</td><td>更大、更小或正确</td><td>下一次猜测</td><td>猜中为 1，否则为 0</td></tr>
+        </table>
+
+        <h3>2. 历史与轨迹</h3>
+        <p>
+            Agent 只能根据过去的动作和观测做决定，看不到环境的隐藏状态（这里是数字 11）。历史 $h_t = (o_0, a_0, o_1, \ldots, o_t)$，策略是 $\pi_\theta(a_t \mid h_t)$。轨迹还可以包含每一步的奖励：$\tau = (o_0, a_0, r_1, o_1, \ldots, a_{T-1}, r_T, o_T)$，总奖励 $R(\tau) = \sum_{t=1}^{T} r_t$。猜数字里只有猜中那一步奖励为 1，其余为 0。
+        </p>
+
+        <h3>3. 轨迹的概率</h3>
+        <p>
+            一条轨迹出现的概率，由策略和环境共同决定：
+        </p>
+        $$p_\theta(\tau \mid x) = \prod_t \pi_\theta(a_t \mid h_t)\, P(o_{t+1}, r_{t+1} \mid h_t, a_t, x)$$
+        <p>
+            我们不知道环境的概率 $P$，但可以通过和环境交互从中采样。
+        </p>
+
+        <h3>4. 目标：最大化期望奖励</h3>
+        $$J(\theta) = \mathbb{E}_{\tau \sim p_\theta(\cdot \mid x)}[R(\tau)]$$
+        <p>
+            假设当前策略产生四条轨迹的概率分别是 0.30、0.20、0.25、0.25，奖励分别是 1、1、0、0，那么期望奖励是 0.30 + 0.20 = 0.50。训练就是调整 θ，把概率从低奖励轨迹挪到高奖励轨迹上。
+        </p>
+    </section>
+
+    <section>
+        <h2>四、专家迭代</h2>
+        <p>
+            最简单的做法是 ReST（Reinforced Self-Training，Gulcehre 等）及其变体 ReST-EM（Singh 等）。循环三步：生长，用当前策略采样轨迹并计算奖励；改进，用奖励过滤数据，加入已有数据集，训练策略；重复，换用更新后的策略。
+        </p>
+        <p>
+            损失就是标准的 SFT 损失，只不过只用高奖励的轨迹。在猜数字里，保留 τ₁、τ₂，丢掉 τ₃、τ₄：
+        </p>
+        $$\mathcal{L}_{ReST} = -\sum_{\tau:\, R(\tau)=1} \sum_t \log \pi_\theta(a_t \mid h_t)$$
+    </section>
+
+    <section>
+        <h2>五、策略梯度</h2>
+
+        <h3>1. 为什么不能直接反向传播</h3>
+        <p>
+            从参数 θ 到奖励之间有两处不可微：动作是离散的、采样出来的，改变 θ 会改变动作的概率，但采样这一步没法求导；环境通常也不可微，你没法对单元测试求关于代码的导数。$p_\theta(\tau \mid x)$ 随 θ 变化，而 $R(\tau)$ 要等 rollout 结束才能观察到。通用的解决办法是策略梯度，也叫 REINFORCE（Williams，1992）。
+        </p>
+
+        <h3>2. 推导</h3>
+        <p>
+            期望奖励写成求和：$J(\theta) = \sum_\tau p_\theta(\tau \mid x) R(\tau)$。求梯度时只有概率依赖 θ：
+        </p>
+        $$\nabla_\theta J = \sum_\tau \nabla_\theta p_\theta(\tau \mid x)\, R(\tau)$$
+        <p>
+            乘以再除以轨迹概率，并利用 $\nabla p / p = \nabla \log p$：
+        </p>
+        $$\nabla_\theta J = \sum_\tau p_\theta(\tau \mid x)\, R(\tau)\, \nabla_\theta \log p_\theta(\tau \mid x) = \mathbb{E}_{\tau \sim p_\theta}\big[R(\tau)\, \nabla_\theta \log p_\theta(\tau \mid x)\big]$$
+        <p>
+            这是一个期望，可以用采样来估计：从当前策略采样一条轨迹，环境给出 $R(\tau)$，再计算 $\nabla_\theta \log p_\theta(\tau \mid x)$。
+        </p>
+
+        <h3>3. 轨迹对数概率的梯度</h3>
+        <p>
+            对轨迹概率取对数，乘积变成求和：
+        </p>
+        $$\log p_\theta(\tau \mid x) = \sum_t \log P(o_{t+1}, r_{t+1} \mid h_t, a_t, x) + \sum_t \log \pi_\theta(a_t \mid h_t)$$
+        <p>
+            环境那部分和 θ 无关，是常数，求梯度时消失。所以：
+        </p>
+        $$\nabla_\theta \log p_\theta(\tau \mid x) = \sum_t \nabla_\theta \log \pi_\theta(a_t \mid h_t)$$
+        <p>
+            一个动作 $a_t$ 由多个 token $u_{t,1}, \ldots, u_{t,m}$ 组成，它的对数概率就是这些 token 对数概率之和。这和 SFT 的计算完全一样，都是把 token 的对数概率加起来，区别只在于这些 token 是策略自己采样出来的。再乘以 $R(\tau)$，就得到梯度估计。
+        </p>
+
+        <h3>4. 实际计算：掩码加缩放</h3>
+        <p>
+            实际上就是对标准 SFT 损失做掩码和缩放。在猜数字的 token 序列里，策略采样出的 token（包括轮次结束 token）掩码为 1；提示和观测 token 不是策略选的，掩码为 0；整条轨迹共用一个标量 $R(\tau)$：
+        </p>
+        $$\mathcal{L}_{PG} = -R(\tau) \sum_{t:\, m_t=1} \log \pi_\theta(u_t \mid u_{&lt;t})$$
+        <p>
+            训练循环分四步：收集，采样任务实例并让 Agent 在上面运行；评估，计算每条轨迹的奖励；构造损失，用奖励给动作的对数概率加权；更新，反向传播、改变 θ，然后用新策略收集下一批。批量形式是 $\mathcal{L}_{PG} = -\sum_i R(\tau_i) \sum_t \log \pi_\theta(a_{i,t} \mid h_{i,t})$。
+        </p>
+        <p>
+            当奖励只有 0 和 1 时，REINFORCE 的损失就等于只在成功轨迹上做 SFT，和 ReST 非常像。区别是 ReST 分批更新，并且会累积数据集。
+        </p>
+    </section>
+
+    <section>
+        <h2>六、基线与优势：比预期好多少</h2>
+
+        <h3>1. 奖励应该是相对的</h3>
+        <p>
+            基础的 REINFORCE 有一个问题：τ₁ 的奖励是 1，它的所有动作都被上调；τ₃ 的奖励是 0，完全不产生梯度，和 ReST 一样白白浪费了。更新应该取决于"策略在这个例子上通常做得怎样"。
+        </p>
+
+        <h3>2. 优势</h3>
+        <p>
+            优势（advantage）衡量一个动作比策略的平均水平好多少：
+        </p>
+        $$A^\pi(h, a) = Q^\pi(h, a) - V^\pi(h)$$
+        <p>
+            $Q^\pi(h, a)$ 是在历史 h 下做动作 a 之后的期望奖励，$V^\pi(h)$ 是从 h 出发的期望奖励。例子：历史是"猜 8 更大，猜 12 更小"，数字只可能是 9、10、11，还剩两次机会。猜 11 的话，如果错了还剩两个候选、一次机会，优势为负；猜 10 的话，如果错了（会知道更大还是更小）只剩一个候选、一次机会，一定能猜中，优势为正。
+        </p>
+        <p>
+            $Q^\pi$ 和 $V^\pi$ 都不知道，所以用采样得到的奖励来估计：$\hat A_t = R(\tau) - b(h_t)$，其中 $b(h_t)$ 是对 $V^\pi(h_t)$ 的一个估计，叫做基线。策略梯度变成：
+        </p>
+        $$\hat\nabla_\theta J = \sum_t \big(R(\tau) - b(h_t)\big)\, \nabla_\theta \log \pi_\theta(a_t \mid h_t)$$
+        <p>
+            基线的不同选法对应不同的算法：常数（后面的老虎机例子）；奖励的滑动平均，随策略改进而调整；训练一个价值模型 $V_\phi(h_t)$，就是 actor-critic 和 PPO；同组样本的平均奖励，不需要额外模型，就是 GRPO。
+        </p>
+
+        <h3>3. 基线不会让梯度有偏</h3>
+        <p>
+            只要基线只依赖历史、不依赖动作，减去它不会改变梯度的期望。证明：
+        </p>
+        $$\mathbb{E}_{a\sim\pi_\theta}\big[b(h)\nabla_\theta \log \pi_\theta(a \mid h)\big] = b(h)\sum_a \pi_\theta(a \mid h)\nabla_\theta \log \pi_\theta(a \mid h) = b(h)\nabla_\theta \sum_a \pi_\theta(a \mid h) = b(h)\nabla_\theta 1 = 0$$
+        <p>
+            中间用到 $\pi \nabla \log \pi = \nabla \pi$，最后所有动作的概率之和恒为 1，导数为 0。
+        </p>
+
+        <h3>4. 一个能算清楚的例子：两臂老虎机</h3>
+        <p>
+            只有一个参数 θ 和两个动作。概率 $p = \sigma(\theta)$ 选 A（奖励 1），$1-p$ 选 B（奖励 0）。当前 θ = −1.1，p = 0.25。
+        </p>
+        <p>
+            不加基线：采样到 A，奖励 1，$\partial \log \pi(A)/\partial\theta = 1 - p = 0.75$，梯度 +0.75，A 变得更可能。采样到 B，奖励 0，梯度为 0，什么都不发生。
+        </p>
+        <p>
+            加基线 b = 0.5：采样到 A，优势 1 − 0.5 = +0.5，乘以 0.75，梯度 +0.375。采样到 B，优势 0 − 0.5 = −0.5，$\partial \log \pi(B)/\partial\theta = -p = -0.25$，梯度为 +0.125，同样提高 A 的概率，也就是降低 B 的概率。基线让失败也能提供学习信号。
+        </p>
+        <p>
+            两种情况下梯度的期望都是 0.25 × 0.75 = 0.1875（加基线时是 0.25 × 0.375 + 0.75 × 0.125，同样等于 0.1875）。但方差不同：不加基线时标准差为 0.325，加基线 0.5 时为 0.108。课上的交互演示反复采样，两种情况的滑动平均都收敛到 0.188，但加基线的波动小得多。
+        </p>
+
+        <h3>5. 基线能做什么，不能做什么</h3>
+        <p>
+            能做的：标出一条轨迹比预期好还是差；好的基线能降低梯度方差。不能做的：同一条轨迹里所有动作的优势相同，比如 τ₁ 的四次猜测都是 +0.5，分不清哪一步好哪一步差；估计 $V^\pi(h)$ 可能需要单独训练一个价值模型。
+        </p>
+
+        <h3>6. 中间奖励：只看之后的奖励</h3>
+        <p>
+            如果环境在最后一步之前就给奖励，可以用"剩余奖励"（reward-to-go）来降低方差：$R_t = \sum_{t'=t+1}^{T} r_{t'}$。一个动作只按它之后的奖励加权，之前的奖励与它无关，去掉不会引入偏差，但能降低方差。比如某一步工具调用得了 +0.2，它不计入之后动作的权重。猜数字只在最后给奖励，所以每个动作的 $R_t$ 都等于 $R(\tau)$。
+        </p>
+    </section>
+
+    <section>
+        <h2>七、组内相对优势：GRPO</h2>
+
+        <h3>1. 用同一任务的多次采样当基线</h3>
+        <p>
+            对同一个任务实例采样多次，就能直接算出"比预期好多少"，不需要额外的模型。基线取组内平均 $\bar R = \frac{1}{G}\sum_{j=1}^G R(\tau_j)$，再除以组内标准差：
+        </p>
+        $$\hat A_j = \frac{R(\tau_j) - \bar R}{\sigma_R}$$
+        <p>
+            猜数字的四条轨迹：奖励 1、1、0、0，平均 0.5，标准差 0.5；中心化后 +0.5、+0.5、−0.5、−0.5；除以 0.5 得到优势 +1、+1、−1、−1。
+        </p>
+
+        <h3>2. GRPO 的更新</h3>
+        <p>
+            一个批次包含多个任务实例，每个实例有自己的一组 rollout，各自单独归一化：
+        </p>
+        <table>
+            <tr><th>任务实例</th><th>G 个 rollout 的奖励</th><th>组平均</th><th>优势估计</th></tr>
+            <tr><td>x₁（藏 11）</td><td>1, 1, 0, 0</td><td>0.50</td><td>+1, +1, −1, −1</td></tr>
+            <tr><td>x₂（藏 3）</td><td>1, 0, 0, 0</td><td>0.25</td><td>+1.73, −0.58, −0.58, −0.58</td></tr>
+            <tr><td>x₃（藏 7）</td><td>1, 1, 1, 0</td><td>0.75</td><td>+0.58, +0.58, +0.58, −1.73</td></tr>
+        </table>
+        $$\mathcal{L}_{GRPO} = -\sum_i \frac{1}{G}\sum_{j=1}^G \hat A_{ij} \sum_t \log \pi_\theta(a_{ij,t} \mid h_{ij,t})$$
+        <p>
+            这里写的是只用当前策略轨迹的简化版本，省略了原论文（DeepSeekMath，Shao 等）里的概率比、裁剪和 KL 项，这些留到下一讲。
+        </p>
+
+        <h3>3. DrGRPO 的两处修改</h3>
+        <p>
+            DrGRPO（Liu 等）去掉了 GRPO 里的两个除法：
+        </p>
+        <ul>
+            <li>不再除以组内标准差。标准差是在每组内部算的，各任务实例不同。策略几乎总是通过或几乎总是失败的实例，标准差很小，除完之后权重反而更大。</li>
+            <li>不再除以回答长度 $|y_j|$，改为除以一个全局常数 C（论文用生成预算）。原来按回答长度平均，一个长的错误回答分摊到每个 token 上的惩罚比短的错误回答更小，策略就会逐渐偏向更长的错误回答。</li>
+        </ul>
+        <p>
+            奖励本身不变，改变的是不同任务实例、不同回答之间的相对权重。在 DrGRPO 中，同一条轨迹里每个生成的 token 共享这条轨迹的优势：τ₁ 的优势是 $R - \bar R = +0.5$，每个 token 的系数是 +0.5/C；τ₃ 是 −0.5/C。
+        </p>
+        $$\mathcal{L}_{DrGRPO} = -\frac{1}{G}\sum_{j=1}^G \frac{1}{C}\sum_{t:\, m_{j,t}=1} \hat A_j \log \pi_\theta(u_{j,t} \mid u_{j,&lt;t})$$
+
+        <h3>4. 全对或全错的组没有梯度</h3>
+        <p>
+            如果一组里所有奖励都相同，优势全是 0，这组就不贡献梯度。全部失败 [0, 0, 0, 0]，可能对当前策略太难；全部成功 [1, 1, 1, 1]，可能太简单。如果所有采样都失败，可以怎么办？换任务实例、扩大探索、加入示范，或者提供信息量更大的奖励。
+        </p>
+
+        <h3>5. GRPO 和 PPO</h3>
+        <p>
+            GRPO 被提出时是作为 PPO 的更高效替代。PPO 要单独训练一个价值模型来估计基线，GRPO 用组内相对优势，省掉了这个模型。PPO 里的概率比、裁剪和参考模型项会在进阶 RL 那一讲讲。
+        </p>
+    </section>
+
+    <section>
+        <h2>八、小结</h2>
+        <p>
+            本讲的所有方法，都是给 Agent 做过的动作加权，区别主要在权重：
+        </p>
+        $$\hat\nabla_\theta J = \sum_t w_t \nabla_\theta \log \pi_\theta(a_t \mid h_t)$$
+        <ul>
+            <li>ReST-EM：成功轨迹上 $w_t = 1$，其余为 0，也就是在保留的数据上做 SFT。</li>
+            <li>REINFORCE：$w_t = R(\tau)$，动作所在轨迹的奖励。</li>
+            <li>GRPO / DrGRPO：$w_t = \hat A_j$，相对于同一任务其他 rollout 的奖励。</li>
+        </ul>
+        <p>
+            从策略采样轨迹并按奖励加权，解决了开头的三个问题：目标是期望奖励，任何成功的轨迹都会被强化；Agent 能根据奖励从不理想的轨迹中学习；轨迹来自当前策略，Agent 学会从自己的错误中恢复。下一讲的主题是异步 RL、离线策略数据和重要性加权。
+        </p>
+    </section>
+
+    <footer class="document-footer">
+        <p>CMU 11-768: AI Agents · Fall 2026</p>
+        <nav class="footer-nav">
+            <a href="08_监督微调SFT.html">&larr; 上一讲</a>
+            <a href="index.html">返回主目录</a>
+            <a href="10_深度研究Agent.html">下一讲 &rarr;</a>
+        </nav>
+    </footer>
+</article>
+
+</body>
+</html>

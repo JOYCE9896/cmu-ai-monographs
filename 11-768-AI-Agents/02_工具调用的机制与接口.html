@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>第二讲：工具调用的机制与接口 | CMU 11-768 课程笔记</title>
+    <link rel="stylesheet" href="tufte.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body, {delimiters: [{left: '$$', right: '$$', display: true}, {left: '$', right: '$', display: false}]});"></script>
+</head>
+<body>
+
+<nav class="top-nav">
+    <a href="01_什么是Agent与模型加循环.html">&larr; 上一讲</a>
+    <span>CMU 11-768: Lecture 02</span>
+    <a href="03_长上下文与上下文管理.html">下一讲 &rarr;</a>
+</nav>
+
+<article>
+    <header>
+        <h1>第二讲：工具调用的机制与接口</h1>
+        <p class="subtitle">模型怎样把"预测 token"变成"执行动作"，以及围绕它的格式约束、API 接口、MCP 与评估</p>
+        <div class="author-meta">
+            主讲：Graham Neubig · 2026 年 8 月 27 日<br>
+            资料来源：<a href="https://www.cmu-agents.com/slides/lecture-02-tool-use.pdf" target="_blank">课程幻灯片</a> · <a href="https://www.youtube.com/watch?v=jXChFB4JSyw" target="_blank">课堂录像</a>
+        </div>
+    </header>
+
+    <section>
+        <h2>一、什么是工具，为什么需要它</h2>
+        <p>
+            课程采用 Wang 等人在论文 What Are Tools Anyway?（COLM 2024）里的定义：工具是语言模型用来调用外部计算机程序的接口。搜索引擎、计算器、浏览器、Python 解释器、各种 API 都算工具。这里有一个贯穿全讲的原则：模型只负责提出调用请求，要不要执行、怎么执行，由外部软件决定。
+        </p>
+        <p>
+            工具带来的好处分两类。一类是扩展：让模型获得它参数里没有的信息或能力，比如今天的新闻、你账户里的数据。另一类是代劳：把外部程序做得更可靠、更高效的事交给它们，比如精确计算。
+        </p>
+        <table>
+            <tr><th>需求</th><th>工具示例</th><th>好处</th></tr>
+            <tr><td>最新信息</td><td>搜索</td><td>拿到新鲜的证据</td></tr>
+            <tr><td>精确计算</td><td>计算器或 Python</td><td>执行结果可靠</td></tr>
+            <tr><td>私有状态</td><td>账户 API</td><td>经过授权的应用数据</td></tr>
+            <tr><td>对外动作</td><td>浏览器或 API</td><td>真正改变环境</td></tr>
+        </table>
+        <p>
+            但调用工具有代价：会增加延迟、花钱、可能失败，也可能带来风险。所以只有当好处大于这些代价时才值得调用。
+        </p>
+    </section>
+
+    <section>
+        <h2>二、从需求倒推工具：以 ChatGPT 为例</h2>
+        <p>
+            设计工具的思路是先想清楚要什么能力，再为每一类交互定义一个范围窄、类型明确的接口。课堂以"如何搭一个 ChatGPT"为例，列出了几种基本调用：
+        </p>
+        <ul>
+            <li><code>finish(text)</code>：返回最终文字并结束 Agent 循环。它不调用任何外部程序，是 Harness 自己的控制动作。比如问"加纳的首都是哪里"，模型直接调用 <code>finish("Accra is the capital of Ghana.")</code>。</li>
+            <li><code>search_web(query)</code>：从网上检索信息，比如回答"CMU 今天发布了什么消息"。</li>
+            <li><code>execute_code(code)</code>：在隔离环境里运行代码并返回输出。问 18、23、41、54 的平均数，模型写 <code>sum([18,23,41,54])/4</code>，得到 34.0。</li>
+            <li><code>generate_image(query)</code>：根据文字描述生成图片。</li>
+            <li>自定义函数，比如 <code>create_grocery_cart(items)</code>：用一个有类型的调用暴露某个应用特有的功能。传入香蕉、牛奶、咖啡，返回"购物车 C17，3 件商品，31.42 美元"。</li>
+        </ul>
+    </section>
+
+    <section>
+        <h2>三、用代码当工具</h2>
+        <p>
+            上面的工具每次只做一件事。如果任务需要循环、中间变量、调用多个库，一次次单独调用工具会很慢。另一个做法是让模型直接写一段代码，用代码把多个操作组合在一次动作里。What Are Tools Anyway? 把代码称为一种"元工具"：它本身能组合控制流、库函数和多个操作。
+        </p>
+        <p>
+            CodeAct（Wang 等，ICML 2024）系统比较了这种做法。它让模型用可执行的 Python 代码作为动作，和用 JSON 或纯文本描述动作做对比。幻灯片给出的结果是：在展示的 8 个模型里，用代码当动作的成功率 8 个都最高；需要的交互轮数有 7 个最少。放到全部 17 个模型上，两项都是 12 个模型最好。
+        </p>
+        <p>
+            代码是一种威力很大的工具，也因此需要小心：
+        </p>
+        <ul>
+            <li>表达力强：有循环、变量和库，适合多步骤的数据处理和组合。</li>
+            <li>难以约束：可能的动作范围很大，校验起来不如一个窄接口的函数精确。</li>
+            <li>影响面大：可以动文件、网络和进程。所以必须配合沙盒、资源限制、权限控制和审计日志。</li>
+        </ul>
+    </section>
+
+    <section>
+        <h2>四、工具调用在底层是怎么实现的</h2>
+
+        <h3>1. 消息先被模板拼成一串文字</h3>
+        <p>
+            我们平时调 API 发送的是一组带角色的消息：system（系统指令）、user（用户）、assistant（模型）。但模型本身只接受一整串 token。聊天模板负责把这些消息拼接起来。以 Qwen 模型为例，每条消息会被包在 <code>&lt;|im_start|&gt;角色</code> 和 <code>&lt;|im_end|&gt;</code> 之间：
+        </p>
+<pre><code>&lt;|im_start|&gt;system
+Be concise.&lt;|im_end|&gt;
+&lt;|im_start|&gt;user
+Weather in Pittsburgh?&lt;|im_end|&gt;
+&lt;|im_start|&gt;assistant
+I need current data.&lt;|im_end|&gt;</code></pre>
+        <p>
+            角色是 API 层面的结构，模板把它们序列化成一条模型输入。
+        </p>
+
+        <h3>2. 工具定义进入提示，调用从输出出来</h3>
+        <p>
+            发送请求时，Harness 在 <code>messages</code> 之外再传一个 <code>tools</code> 参数，里面是每个工具的 JSON Schema。模板把这些定义也放进提示，比如放在 <code>&lt;tools&gt;…&lt;/tools&gt;</code> 里。模型如果决定查天气，就输出：
+        </p>
+<pre><code>&lt;tool_call&gt;
+{"name":"get_weather", "arguments":{"city":"Pittsburgh"}}
+&lt;/tool_call&gt;</code></pre>
+        <p>
+            模型只生成调用的内容，API 返回响应时会给这次调用附上一个唯一的编号。
+        </p>
+
+        <h3>3. 同一个调用，不同模型写法不同</h3>
+        <p>
+            工具的 Schema 是统一的，但每个模型家族在训练时学的输出格式不一样，Harness 必须用对应的方式解析。幻灯片对比了三种：
+        </p>
+        <ul>
+            <li>Qwen 3.8：用函数标签和参数标签，写成 <code>&lt;function=get_weather&gt;&lt;parameter=city&gt;Pittsburgh&lt;/parameter&gt;&lt;/function&gt;</code>。</li>
+            <li>Mistral Small 4：用一个控制 token <code>[TOOL_CALLS]</code>，后面跟 JSON 数组，并且模型自己输出调用编号。</li>
+            <li>DeepSeek V3.2：用一种叫 DSML 的标记块，<code>&lt;｜DSML｜function_calls&gt;</code> 里再套 <code>invoke</code> 和 <code>parameter</code>。</li>
+        </ul>
+
+        <h3>4. Harness 如何分发调用：以 OpenHands 为例</h3>
+        <p>
+            OpenHands 是 Graham Neubig 参与开发的开源编程 Agent。它的处理分两步。初始化时，把每个工具规格（比如 BashTool）解析并配置好，建立一张"工具名到定义"的表 <code>tools_map</code>，每个定义包含 Schema、动作类型和执行器。每次模型发出调用时，按顺序做五件事：解析出名称和参数；在表里查到工具；用 <code>action_from_arguments</code> 校验参数并构造动作；交给执行器运行；返回一个带调用编号的 ObservationEvent。
+        </p>
+
+        <h3>5. 结果按编号对回去</h3>
+        <p>
+            工具执行完，结果以一条 role 为 tool 的消息送回，里面的 <code>tool_call_id</code> 和原调用的 <code>id</code> 一致。模型一次发出多个调用时，就靠这个编号知道哪个结果属于哪个调用。
+        </p>
+    </section>
+
+    <section>
+        <h2>五、约束解码：保证输出格式合法</h2>
+
+        <h3>1. 问题：模型会写出坏掉的调用</h3>
+        <p>
+            模型是逐个 token 生成的，完全可能漏掉一个右花括号，写出 <code>{"name":"get_weather", "arguments":{"city":"Pittsburgh"}</code>。这样的 JSON 解析不了，Harness 就无法执行。
+        </p>
+        <p>
+            对工具调用的约束可以分四层：语法（是合法的 JSON）、结构（字段齐全）、类型（city 是字符串）、取值（units 只能是 C 或 F）。课程特别提醒：这些约束只能保证"形式正确"，保证不了内容是真的、有没有权限、选的工具对不对、任务能不能完成。
+        </p>
+
+        <h3>2. JSON Schema 描述"合法"是什么</h3>
+<pre><code>{
+  "type": "object",
+  "properties": {
+    "city": {"type": "string"},
+    "units": {"enum": ["C", "F"]}
+  },
+  "required": ["city"],
+  "additionalProperties": false
+}</code></pre>
+        <p>
+            按这个 Schema，<code>{"city":"Pgh","units":"F"}</code> 合法，<code>{"city":"Pgh","units":"K"}</code> 不合法。两者都是正确的 JSON，但只有 F 能从规则"unit 是 C 或 F"推导出来。可以把 Schema 看成一套语法规则，合法的输出就是能按规则一步步推出来的字符串。
+        </p>
+
+        <h3>3. 下推自动机：检查嵌套结构的工具</h3>
+        <p>
+            怎样在生成过程中实时检查"到目前为止是否仍然可能合法"？JSON 可以无限嵌套（对象里套数组，数组里再套对象），普通的有限状态机记不住嵌套了几层。所以要用下推自动机（Pushdown Automaton，PDA）：它在有限状态之外加了一个栈。状态记录当前处在语法规则的哪个位置（比如"正在等一个值"、"正在等逗号"）；栈记录嵌套层次，遇到 <code>{</code> 就压入"对象"，遇到 <code>[</code> 压入"数组"，遇到对应的右括号就弹出。栈为空时说明结构完整。
+        </p>
+
+        <h3>4. 检查发生在 token 以下的字节层面</h3>
+        <p>
+            这里有一个技术难点：模型的 token 和语法的单位对不上。一个 token 可能跨越好几个语法单元（比如 <code>"F"}</code> 这个 token 同时包含引号、字母、引号和右花括号），也可能只包含某个单元的一半。所以不能在 token 边界上做语法判断。
+        </p>
+        <p>
+            XGrammar（Dong 等，MLSys 2025）的做法是：先把语法一次性编译成按字节工作的 PDA；生成每一步时，对每个候选 token，把它解码成字节，逐字节喂给 PDA，看能否继续推进。能推进就允许，不能就把这个 token 的概率屏蔽掉（mask），使模型不可能选它。
+        </p>
+
+        <h3>5. 如何做得快</h3>
+        <p>
+            词表里有十几万个 token，每步都逐个检查太慢。XGrammar 的加速分四步：
+        </p>
+        <ol>
+            <li>解析前缀：用持久化的 PDA 栈跟进已经生成的字节。</li>
+            <li>读取缓存：大多数 token 是否合法只取决于栈顶的语法节点，和更深的上下文无关，这些结果可以预先算好，按栈顶节点查表即可。</li>
+            <li>只检查少数：剩下那些合法性依赖完整上下文的 token，才拿完整的栈去跑。</li>
+            <li>屏蔽并继续：合并结果、屏蔽 logits、采样一个 token、更新栈。</li>
+        </ol>
+        <p>
+            幻灯片总结了加速来源：缓存处理掉大部分 token；持久化栈支持分支；CPU 上的检查工作和 GPU 上的模型推理同时进行，互不等待。
+        </p>
+    </section>
+
+    <section>
+        <h2>六、通过 REST API 调用外部服务</h2>
+
+        <h3>1. 库函数和网络服务的区别</h3>
+        <p>
+            写一个 Python 函数 <code>get_weather(city, units)</code>，用 Pydantic 标注好参数和返回值类型，这是一个进程内的 API：调用者和函数在同一个程序里。它还不能被远程调用，因为网络上的客户端还需要地址、通信协议、数据序列化方式和身份认证。
+        </p>
+
+        <h3>2. REST API 把函数暴露到 HTTP 上</h3>
+        <p>
+            用 FastAPI 可以把这个函数绑定到一个 HTTP 地址 <code>GET /weather</code>，参数从查询字符串读，并要求请求头里带 <code>X-API-Key</code> 作为密钥。FastAPI 还会自动生成一份 OpenAPI 描述文档，写明有哪些操作、每个参数在哪里（query 还是 header）、类型和取值范围（里面嵌的仍然是 JSON Schema）、需要哪种认证。OpenAPI 描述的是 HTTP 操作，JSON Schema 描述的是其中的值。
+        </p>
+
+        <h3>3. 编程 Agent 常用 curl 直接调</h3>
+        <p>
+            有 shell 权限的编程 Agent 往往直接读 API 文档，然后拼一条 curl 命令：
+        </p>
+<pre><code>curl -sS -G https://weather.example/weather \
+  --data-urlencode "city=Pittsburgh" \
+  --data-urlencode "units=F" \
+  -H "X-API-Key: $WEATHER_API_KEY"</code></pre>
+        <p>
+            这很简单，但有一个安全问题：密钥放在环境变量里，Agent 的 shell 能读到它，也就可能泄露或滥用它。
+        </p>
+    </section>
+
+    <section>
+        <h2>七、MCP：另一种给 Agent 提供能力的方式</h2>
+        <p>
+            MCP（Model Context Protocol，模型上下文协议）规定了 AI 应用如何发现和调用外部能力。结构上，一个 MCP Host（比如某个 AI 应用）里有多个 Client，每个 Client 连一个 MCP Server。Server 可以在本地通过标准输入输出（stdio）连接，比如文件系统服务；也可以在远程通过 HTTP 连接，比如 Sentry 错误监控服务。课程强调：MCP 是给 Agent 用的另一种接口，调用 REST API 并不一定要经过 MCP。
+        </p>
+        <p>
+            FastMCP 这个库可以读取一份 OpenAPI 描述，把每个 HTTP 操作自动变成一个可被发现的 MCP 工具，比如 <code>GET /weather</code> 变成 <code>get_weather(city, units)</code>。
+        </p>
+        <p>
+            MCP 在凭证管理上的价值在于"凭证中转"（credential brokering）。部署时用两把不同的密钥：<code>UPSTREAM_API_KEY</code> 由 MCP Server 保管，用来调用真正的天气 API；<code>MCP_API_KEY</code> 用来保护 MCP 这个入口。Agent 的 Harness 只拿着 MCP 密钥，Server 验证通过后，再用上游密钥去调 API。这样模型两把密钥都看不到，Server 能在中间控制谁可以访问什么。幻灯片也注明，示例里的静态令牌只适合教学和开发，生产环境应该验证 JWT 或使用 OAuth。
+        </p>
+        <table>
+            <tr><th></th><th>OpenAPI / HTTP API</th><th>MCP</th></tr>
+            <tr><td>共同点</td><td colspan="2">名称、描述，以及描述输入结构的 JSON Schema</td></tr>
+            <tr><td>发现</td><td>获取一份 OpenAPI 文档</td><td>运行时调用 <code>tools/list</code></td></tr>
+            <tr><td>调用</td><td>HTTP 方法 + 路径 + 参数</td><td>通过 MCP 传输层发 <code>tools/call</code></td></tr>
+            <tr><td>认证</td><td>客户端直接向 API 认证</td><td>客户端向 MCP 认证，上游认证另行处理</td></tr>
+            <tr><td>范围</td><td>只描述 HTTP 操作</td><td>还支持资源、提示模板和扩展</td></tr>
+        </table>
+    </section>
+
+    <section>
+        <h2>八、同时调用多个工具</h2>
+        <p>
+            假设一个请求要查天气、看日历、查航班。如果一个接一个调用，每次都要"模型生成一轮、等工具返回"。按幻灯片的数字，每轮生成 0.8 秒，三个工具分别 1.2、0.9、1.1 秒，串行总共约 6.4 秒。
+        </p>
+        <p>
+            如果模型在一轮里同时发出三个调用，Harness 并发执行，只需要两次生成加上最慢那个工具的时间：2 × 0.8 + max(1.2, 0.9, 1.1) ≈ 2.8 秒。
+        </p>
+        <p>
+            前提是这些调用彼此独立。"查天气、读日历、查航班"可以并行；"先查客户编号，再用编号查订单，再退款某个订单"就必须按顺序，因为后一步要用前一步的结果。实现并发时，结果返回的顺序可能和发出的顺序不同，必须保留调用编号来对应。课上的 Python 写法是用 <code>asyncio.gather</code> 并发执行，每个任务返回 <code>(call_id, value)</code>，并设置 <code>return_exceptions=True</code>，让一个工具出错不影响拿到其他结果。
+        </p>
+    </section>
+
+    <section>
+        <h2>九、怎样评估工具调用</h2>
+        <p>
+            伯克利函数调用排行榜（Berkeley Function Calling Leaderboard，BFCL）第 4 版是常用的基准，测试分四类：单轮调用（简单、多个候选函数、并行、多个并行）；多轮调用（基础、缺少函数、缺少参数、长上下文）；Agent 场景（网页搜索、记忆）；稳健性（是否编造不存在的调用、对格式变化是否敏感）。
+        </p>
+        <p>
+            课程建议从四个层次评估整个系统：
+        </p>
+        <table>
+            <tr><th>层次</th><th>问题</th><th>指标示例</th><th>是否要真实执行</th><th>常见失败</th></tr>
+            <tr><td>选择</td><td>选对工具了吗</td><td>精确率 / 召回率</td><td>否</td><td>漏调或多调</td></tr>
+            <tr><td>参数</td><td>参数值对吗</td><td>语法树或 Schema 匹配</td><td>否</td><td>字段或值错误</td></tr>
+            <tr><td>轨迹</td><td>顺序对吗</td><td>序列成功率</td><td>通常要</td><td>依赖关系搞错</td></tr>
+            <tr><td>任务</td><td>目标达成了吗</td><td>端到端成功率</td><td>要</td><td>看似合理的错误答案</td></tr>
+        </table>
+        <p>
+            除了准确率，还要看运营层面的质量：效率（延迟、调用次数、token 数、成本），一个正确但太慢太贵的 Agent 也没法用；可靠性（超时、重试、部分失败），要在真实的服务商表现下报告成功率；安全（策略、权限、副作用），要测试恶意输出和有后果的操作。
+        </p>
+        <p>
+            失败来源分三处：模型（选错工具、参数写错、忽略返回结果）；Harness（解析失败、认证失败、校验失败、编号对不上）；服务商或工具本身（超时、限流、执行报错）。幻灯片还引用了 OpenRouter 在 2026 年 8 月 27 日的服务商统计，显示不同服务商的工具调用错误率各不相同。所以生产环境的评估既要看基准准确率，也要看这些运营故障率。
+        </p>
+    </section>
+
+    <section>
+        <h2>十、小结</h2>
+        <p>
+            课程把工具调用总结为一个分层的系统：能力层，工具带来检索、执行、生成和应用操作；机制层，Schema 进入提示，模型按各自协议输出调用，Harness 校验、分发并按编号对回结果；约束层，JSON Schema 和语法屏蔽只保证形式，不保证语义正确；接口层，直接调用 REST 和使用 MCP 是两种暴露能力、管理凭证的方式；系统层，要处理依赖和并发，并从选择、参数、结果、成本和运营故障几方面评估。
+        </p>
+    </section>
+
+    <footer class="document-footer">
+        <p>CMU 11-768: AI Agents · Fall 2026</p>
+        <nav class="footer-nav">
+            <a href="01_什么是Agent与模型加循环.html">&larr; 上一讲</a>
+            <a href="index.html">返回主目录</a>
+            <a href="03_长上下文与上下文管理.html">下一讲 &rarr;</a>
+        </nav>
+    </footer>
+</article>
+
+</body>
+</html>

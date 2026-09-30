@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>第一讲：什么是 Agent，它怎样工作 | CMU 11-768 课程笔记</title>
+    <link rel="stylesheet" href="tufte.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body, {delimiters: [{left: '$$', right: '$$', display: true}, {left: '$', right: '$', display: false}]});"></script>
+</head>
+<body>
+
+<nav class="top-nav">
+    <a href="index.html">&larr; 课程目录</a>
+    <span>CMU 11-768: Lecture 01</span>
+    <a href="02_工具调用的机制与接口.html">下一讲 &rarr;</a>
+</nav>
+
+<article>
+    <header>
+        <h1>第一讲：什么是 Agent，它怎样工作</h1>
+        <p class="subtitle">从预测下一个 token 的语言模型，到能在真实环境里动手做事的系统</p>
+        <div class="author-meta">
+            主讲：Daniel Fried、Graham Neubig · 2026 年 8 月 25 日<br>
+            资料来源：<a href="https://www.cmu-agents.com/slides/lecture-01-agents.pdf" target="_blank">课程幻灯片</a> · <a href="https://www.youtube.com/watch?v=UwfjzyLnvMg" target="_blank">课堂录像</a>
+        </div>
+    </header>
+
+    <section>
+        <h2>一、这一讲要回答的问题</h2>
+        <p>
+            第一讲是整门课的地图。它回答三件事：Agent 到底是什么；一个只会"接着往下写字"的语言模型，是通过什么机制变成能读文件、跑命令、改代码的 Agent 的；以及要让 Agent 真正好用，需要在哪些方向上下功夫。后面二十多讲，基本都是在展开这一讲列出的某个方向。
+        </p>
+        <p>
+            课程开场先摆出了现在 Agent 能做到什么程度。幻灯片引用了 Anthropic 研究员 Nicholas Carlini 在 2026 年发表的一篇文章：16 个并行运行的 Claude Agent，用两周时间写出了一个约 10 万行代码的 C 编译器，而且这个编译器能编译 Linux 内核。随后课堂还放了两段演示，一段是 Jing Yu Koh 在 2024 年做的多模态网页操作 Agent，一段是 Graham Neubig 用 OpenHands 做可视化调试。
+        </p>
+        <p>
+            能力变强之后，新的问题就来了：哪些事可以放手让 Agent 自己做，哪些要先问人，哪些绝对不能交给它。课堂上给出了一组例子让学生分类，比如"排查网店结账为什么失败"、"给 5 万名客户群发产品发布邮件"、"收集税表并替你报税"、"在不影响手机端结账的前提下把支付 API 从 Python 迁到 Rust"、"喜欢的乐队来本地开演唱会就自动买票"、"根据一周的血糖读数调整胰岛素剂量"。这些例子的共同点是：出错的代价差别很大，而且有些操作一旦执行就撤不回来。这个问题会在后面的安全专题里正式讨论。
+        </p>
+    </section>
+
+    <section>
+        <h2>二、Agent 的定义</h2>
+        <p>
+            课程采用的是人工智能教科书《Artificial Intelligence: A Modern Approach》（Russell 与 Norvig 著）里的定义：Agent 是任何能够通过传感器感知环境、并通过执行器作用于环境的东西。
+        </p>
+        <p>
+            这个定义很宽，放到今天基于大语言模型（LLM）的 Agent 身上，四个要素可以这样对应：
+        </p>
+        <ul>
+            <li>环境（Environment）：Agent 所处的工作场所，比如一个代码仓库、一个网站、一个应用程序或者一套工作流程。</li>
+            <li>状态与观测（State / Observations）：Agent 能"看到"的东西，包括对话消息、文件内容、网页、屏幕截图，以及工具返回的结果。</li>
+            <li>动作（Actions）：Agent 能"做"的事，包括回复文字、编辑文件、执行 shell 命令、调用 API、点击鼠标或敲击键盘。</li>
+            <li>奖励（Reward）：衡量做得好不好的信号，比如测试用例是否通过、另一个 LLM 按评分细则打出的分数（LLM-as-a-judge）、用户的正面反馈。</li>
+        </ul>
+        <p>
+            奖励这一项现在看起来和"怎么用 Agent"关系不大，但它在课程后半段的训练部分非常关键：强化学习就是靠奖励信号来调整模型行为的。
+        </p>
+    </section>
+
+    <section>
+        <h2>三、从语言模型到 Agent</h2>
+
+        <h3>1. 回顾：语言模型在做什么</h3>
+        <p>
+            语言模型的基本工作方式叫下一个 token 预测（next-token prediction）。token 是模型处理文本的最小单位，可以是一个词、半个词或一个标点。模型每一步都根据已有的文字，算出"下一个 token 是什么"的概率分布，从中选出一个，把它接到已有文字后面，然后再预测下一个。一段回答就是这样一个 token 一个 token 生成出来的。
+        </p>
+        <p>
+            思维链（Chain of Thought）是在这个机制上的一个用法：让模型在给出最终答案之前，先生成一段中间推理。比如问"2 × (3 + 4) 等于多少"，模型先写出"3 + 4 = 7，7 × 2 = 14"，再输出答案 14。因为推理文字也会成为后续预测的上下文，模型后面的每一步都能"看到"前面的推理，答案因此更可靠。
+        </p>
+
+        <h3>2. 工具定义：让模型知道自己能做什么</h3>
+        <p>
+            语言模型本身只能输出文字。要让它操作外部世界，第一步是告诉它"有哪些工具可以用"。工具定义是一个有类型的接口，包括三部分：工具名称、功能描述，以及用 JSON Schema 描述的参数格式。JSON Schema 是一种描述 JSON 数据长什么样的标准写法，规定有哪些字段、每个字段是什么类型、哪些字段必须填。
+        </p>
+        <p>
+            课上的例子是一个读文件工具：
+        </p>
+<pre><code>{
+  "name": "read_file",
+  "description": "Read a UTF-8 file.",
+  "parameters": {
+    "type": "object",
+    "properties": { "path": { "type": "string" } },
+    "required": ["path"]
+  }
+}</code></pre>
+        <p>
+            模型不能直接"读懂"这种结构化对象，它只认识一串文字。所以还需要一个叫聊天模板（chat template）的步骤，在调用 <code>apply_chat_template</code> 时把工具定义渲染成模型训练时见过的文本格式，比如用 <code>&lt;tools&gt;</code> 标签把 JSON 包起来，塞进提示词里。
+        </p>
+
+        <h3>3. 工具调用与结果</h3>
+        <p>
+            模型看到工具定义后，如果决定调用工具，它输出的不是普通回答，而是一段特定格式的文字，例如：
+        </p>
+<pre><code>&lt;tool_call&gt;
+{"name":"read_file","arguments":{"path":"test.py"}}
+&lt;/tool_call&gt;</code></pre>
+        <p>
+            外部程序把这段文字解析出来，真正去读 <code>test.py</code>，再把文件内容包进 <code>&lt;tool_response&gt;</code> 标签送回给模型。在 API 层面，这一来一回对应两条消息：一条是 assistant 角色发出的工具调用（带一个编号，比如 <code>call_7</code>），一条是 tool 角色返回的结果（用同一个编号 <code>tool_call_id</code> 对应回去）。
+        </p>
+
+        <h3>4. 动作也是 token</h3>
+        <p>
+            这里有一个理解 Agent 的关键点：对语言模型来说，工具调用和普通文字没有本质区别，都是它预测出来的一串 token。区别只在于这串 token 恰好写明了"调用哪个工具、传什么参数"。
+        </p>
+        <p>
+            真正让动作发生的，是模型外面的一层程序，课程称之为 Harness（可以理解为"驾驭层"或"外壳程序"）。Harness 负责四件事：解析模型输出的调用、检查格式和参数是否合法、真正执行、把执行结果作为新的观测 token 交回模型。这个思路最早在 Toolformer（Schick 等，NeurIPS 2023）这篇论文里被系统地研究：让模型学会在文本中间插入 API 调用。
+        </p>
+
+        <h3>5. Agent 就是"模型放进循环里"</h3>
+        <p>
+            把上面几步连起来，就得到了 Agent 的基本结构：一个模型在一个循环里反复运行。每一轮，模型看着当前的上下文（任务、可用工具、历史记录），先推理，再决定一个动作；Harness 执行这个动作，把结果追加到历史里；然后进入下一轮。直到模型调用一个"把答案发给用户"的动作，循环才结束。
+        </p>
+        <p>
+            课上的例子：任务是"test.py 里写了什么？"。模型先推理，决定调用 <code>read_file("test.py")</code>；Harness 执行后返回 <code>def add(a, b): …</code>；模型再调用 <code>send_message</code>，告诉用户"test.py 定义了 add(a, b)"。
+        </p>
+        <p>
+            这种"推理、行动、观察结果、再推理"交替进行的模式，来自 ReAct（Yao 等，ICLR 2023）这篇论文，名字就是 Reasoning 和 Acting 的组合。
+        </p>
+
+        <h3>6. 一个最小的 ReAct 循环</h3>
+        <p>
+            课程用开源项目 mini-swe-agent 展示了这个循环在代码里有多短。核心逻辑是：先放入系统提示和任务说明，然后无限循环调用 <code>step()</code>；每一步先 <code>query()</code> 让模型生成回复，再 <code>execute_actions()</code> 执行回复里的动作，把观测结果加回消息列表。
+        </p>
+<pre><code>def run(self, task: str = "", **kwargs) -&gt; dict:
+    self.messages = []
+    self.add_messages(系统提示, 任务说明)
+    while True:
+        self.step()
+
+def step(self) -&gt; list[dict]:
+    return self.execute_actions(self.query())
+
+def query(self) -&gt; dict:
+    message = self.model.query(self.messages)
+    self.add_messages(message)
+    return message</code></pre>
+        <p>
+            第一次作业（Assignment 1）就是自己实现并扩展一个类似的控制器：创建自己的工具、调用它们，并用在软件工程任务上。课上还展示了 SWE-bench 网站上的一条真实 Agent 运行轨迹。SWE-bench 是一个从真实 GitHub 项目里收集 bug 修复任务的基准，Agent 需要在代码仓库里找到问题、写补丁并通过测试。
+        </p>
+    </section>
+
+    <section>
+        <h2>四、Agent 需要的六种能力</h2>
+        <p>
+            有了基本循环，接下来的问题是怎样让 Agent 做得好。课程把需要的能力归纳为六类，并且指出每一类都有两条改进路线。
+        </p>
+        <p>
+            第一条路线是 LLM 训练：通过预训练、监督微调（SFT）或强化学习（RL）改变模型本身的行为，让推理、使用工具、从错误中恢复这些模式成为模型学到的策略的一部分。第二条路线是 Harness 工程：不动模型，改模型周围的系统，包括提示词、工具、记忆和控制流程，给模型提供上下文、校验、重试和安全边界。最终的能力来自模型和 Harness 的组合。
+        </p>
+        <p>
+            训练路线本身又分三个阶段。预训练用海量文本、代码和多模态数据，让模型学到广泛的表征和规律；中期训练和 SFT 用指令、操作轨迹和工具调用示范，让模型学会格式和做法；RL 用奖励或偏好信号，优化模型在整条轨迹上的行为。
+        </p>
+        <table>
+            <tr><th>能力</th><th>Harness 工程的做法</th><th>LLM 训练的做法</th></tr>
+            <tr><td>1. 准确调用工具</td><td>语法约束解码</td><td>SFT：在工具调用轨迹上训练</td></tr>
+            <tr><td>2. 长上下文中保持连贯</td><td>上下文压缩、动态查找记忆、交给子 Agent 处理</td><td>SFT：长上下文训练</td></tr>
+            <tr><td>3. 可定制</td><td>Agent 记忆、技能（Skills）、自定义工具</td><td>RL：从用户反馈中学习</td></tr>
+            <tr><td>4. 管理复杂任务</td><td>提供规划和任务分解工具、交给子 Agent</td><td>RL：在复杂长程任务上训练</td></tr>
+            <tr><td>5. 理解环境</td><td>学习对应领域知识的技能</td><td>SFT：在带有预期观测格式的数据上训练；RL：在特定领域环境中训练</td></tr>
+            <tr><td>6. 安全</td><td>工具沙盒、限制凭证访问、监控运行轨迹</td><td>RL：考虑安全的强化学习</td></tr>
+        </table>
+        <p>
+            这张表基本就是课程的目录。第 2 到第 5 讲分别讲工具、长上下文、技能与记忆、规划；第 8、9、11 讲讲 SFT 和 RL；安全在第 7 周以后专门展开。
+        </p>
+    </section>
+
+    <section>
+        <h2>五、Agent 是一个系统，不只是一个模型</h2>
+        <p>
+            课程强调，一个能实际运行的 Agent 由好几个软件组件共同组成，模型只是其中之一。幻灯片列出了五个组件，每个都有对应的开源或商业软件：
+        </p>
+        <ul>
+            <li>Harness：管理状态、工具、记忆和控制流；校验动作并处理错误；执行权限和安全边界。例子有 Claude Code、Codex、OpenHands、OpenCode、Pi 这类编程 Agent，以及 LangChain、CrewAI 这类编排框架。</li>
+            <li>沙盒（Sandbox）：把代码和工具的执行隔离开；限制计算资源、网络和文件系统访问；创建可复现的运行环境。例子有 Docker、Apptainer、Modal、Sail。</li>
+            <li>LM 推理：稳定地提供模型生成服务；把多个请求合并成批处理并复用 KV 缓存；管理流式输出、并行和吞吐量。例子有 vLLM、SGLang。KV 缓存会在第三讲详细解释。</li>
+            <li>训练系统：准备数据、收集运行轨迹（rollout）；协调分布式工作节点；保存检查点、评估和复现训练。例子有 SkyRL、Miles。</li>
+            <li>可观测性与监控：记录运行轨迹和指标；跟踪质量、成本和失败情况；比较不同轨迹和评估结果。例子有 Laminar、MLFlow。</li>
+        </ul>
+    </section>
+
+    <section>
+        <h2>六、课程安排与要求</h2>
+        <p>
+            课程的五个学习目标是：在开源 LLM 上从零实现一个 Agent；为多步骤任务设计评估；训练 Agent 提升能力；权衡安全与可靠性；研究一个关于 Agent 的开放问题。对应的顺序是"构建、评估、训练、安全、研究"。
+        </p>
+        <p>
+            三次个人作业依次是 Harness（搭建基础设施并建立可复现的基线）、评估（测量行为、报告失败案例，区分"演示"和"证据"）、训练（训练或调整一个组件，分析行为、成本和稳健性）。后半学期是 2 到 3 人一组的研究项目。成绩构成：三次作业共 40%，课堂要点提交 10%，研究项目 50%（提案 5%、中期检查 5%、展示 10%、最终报告 30%）。
+        </p>
+        <p>
+            学期进度分为六段：8 月 25 日到 9 月 8 日讲 Agent 能力；9 月 10 日到 15 日讲编程和 GUI 两个应用领域；9 月 17 日到 10 月 1 日讲训练（SFT、RL 基础、进阶 RL）和深度研究 Agent；10 月 6 日到 22 日讲框架与安全；10 月 27 日到 11 月 5 日讲人机交互、多 Agent 和项目；11 月 10 日到 12 月 3 日是进阶话题和海报展示。
+        </p>
+        <p>
+            这门课的先修要求很严格：必须有训练语言模型的实际经验，比如修过带 LM 训练作业的大学课程，或者有训练 4B 到 7B 以上模型的预训练、后训练或研究经历，不满足的学生会被要求退课。关于 AI 工具的使用，课程的规定是：作业和项目报告一般允许用 AI 工具，但课堂要点必须自己写；学生要对提交的每一条结论、引用、结果和每一行代码负责，并且可能被当面提问。
+        </p>
+    </section>
+
+    <section>
+        <h2>七、小结</h2>
+        <p>
+            这一讲建立了理解后续内容的基本框架。Agent 是感知环境并采取行动的系统；基于 LLM 的 Agent 把动作写成 token，由 Harness 解析、执行并把结果送回，模型在这个循环里一轮轮推进任务。要让 Agent 更强，可以改模型（训练），也可以改模型周围的系统（Harness 工程），实际系统两者都用。而一个可用的 Agent 还需要沙盒、推理服务、训练系统和监控这些配套组件。
+        </p>
+    </section>
+
+    <footer class="document-footer">
+        <p>CMU 11-768: AI Agents · Fall 2026</p>
+        <nav class="footer-nav">
+            <a href="index.html">&larr; 课程目录</a>
+            <a href="index.html">返回主目录</a>
+            <a href="02_工具调用的机制与接口.html">下一讲 &rarr;</a>
+        </nav>
+    </footer>
+</article>
+
+</body>
+</html>

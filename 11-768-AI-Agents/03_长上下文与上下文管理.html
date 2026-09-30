@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>第三讲：长上下文 Agent 的上下文管理 | CMU 11-768 课程笔记</title>
+    <link rel="stylesheet" href="tufte.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" onload="renderMathInElement(document.body, {delimiters: [{left: '$$', right: '$$', display: true}, {left: '$', right: '$', display: false}]});"></script>
+</head>
+<body>
+
+<nav class="top-nav">
+    <a href="02_工具调用的机制与接口.html">&larr; 上一讲</a>
+    <span>CMU 11-768: Lecture 03</span>
+    <a href="04_技能与记忆.html">下一讲 &rarr;</a>
+</nav>
+
+<article>
+    <header>
+        <h1>第三讲：长上下文 Agent 的上下文管理</h1>
+        <p class="subtitle">Agent 的历史越来越长时，模型结构、训练、推理缓存和上下文压缩分别怎样应对</p>
+        <div class="author-meta">
+            主讲：Graham Neubig · 2026 年 9 月 1 日<br>
+            资料来源：<a href="https://www.cmu-agents.com/slides/lecture-03-long-context.pdf" target="_blank">课程幻灯片</a> · <a href="https://www.youtube.com/watch?v=AiwCCvFW1uE" target="_blank">课堂录像</a>
+        </div>
+    </header>
+
+    <section>
+        <h2>一、问题从哪里来：Agent 的上下文会不断变长</h2>
+        <p>
+            上一讲说过，Agent 是一个循环：每一轮，模型要重新读一遍全部上下文，然后输出一个动作，动作的结果再追加进上下文。这意味着上下文只增不减。
+        </p>
+        <p>
+            幻灯片用一组数字说明这件事有多贵。假设固定前缀（系统提示和工具定义）是 6K token，每轮新增 5K。第 1 次调用输入 6K，第 2 次 11K，第 3 次 16K，第 4 次 21K，第 5 次 26K。每次调用的输入长度线性增长，但把每次的输入加起来，累计处理量是 6K、17K、33K、54K、80K，按平方速度增长。
+        </p>
+        <p>
+            Agent 的上下文里都装了什么？课程统计了 1,500 次 OpenHands 会话，平均每次会话 77,922 个 token。其中工具返回的结果占 37%，系统提示和工具定义占 23%，工具调用占 20%，用户消息和模型推理各占 9%，其余约 2%。工具结果是最大的一块，比如一份很长的日志或一个大文件的内容。
+        </p>
+        <p>
+            由此产生两个挑战。一是容量：模型能不能真正用上这么长的上下文里需要的证据？这由模型结构、位置编码和训练方式决定，需要评估来测量。二是效率：系统能不能负担得起？这由注意力计算、KV 缓存占用的内存、缓存复用和压缩决定，影响成本和延迟。
+        </p>
+    </section>
+
+    <section>
+        <h2>二、背景：模型推理是怎么进行的</h2>
+
+        <h3>1. 推理服务的组成</h3>
+        <p>
+            一个请求（提示词加生成参数）先进入调度器，调度器负责排队、把多个请求合成一批、分配到合适的机器。然后分两个阶段计算：预填充（Prefill）一次性处理提示词的所有位置；解码（Decode）每一步只生成一个新 token，循环进行。两个阶段之间靠 KV 缓存连接，它是每个请求持续存在的状态。最后生成的 token 以流式返回。这个框架来自 DistServe（Zhong 等，OSDI 2024）。
+        </p>
+
+        <h3>2. 什么是 KV 缓存</h3>
+        <p>
+            Transformer 在处理每个 token 时，会为它算出一个 Key 向量和一个 Value 向量（后面讲注意力时会解释它们的用途）。生成新 token 时，新 token 需要和之前所有 token 的 Key、Value 做计算。如果每生成一个 token 都把前面所有 token 重新算一遍，会非常浪费。所以系统把算过的 Key 和 Value 存下来，这就是 KV 缓存。
+        </p>
+        <p>
+            预填充阶段为提示词里的每个位置算出 K、V 并写入缓存，这个阶段计算量大，延迟随提示长度增长。解码阶段每步读取缓存、算出一个新 token、再把新 token 的 K、V 追加进去。解码必须一步步顺序进行，瓶颈主要在于从显存读取缓存的带宽。
+        </p>
+
+        <h3>3. 衡量推理服务的指标</h3>
+        <ul>
+            <li>TTFT（Time To First Token）：从请求到达到第一个 token 输出的时间，主要由预填充决定。</li>
+            <li>TPOT（Time Per Output Token）：相邻两个输出 token 之间的间隔，由解码决定。</li>
+            <li>吞吐量：单位时间内完成的 token 数或请求数。</li>
+            <li>成本：输入 token、命中缓存的输入 token、输出 token 分别计费。</li>
+        </ul>
+
+        <h3>4. 注意力的计算</h3>
+        <p>
+            注意力是 Transformer 的核心运算。输入矩阵 $X$ 的每一行是一个 token 的向量。先用三个矩阵做线性变换，得到查询 $Q = XW_Q$、键 $K = XW_K$、值 $V = XW_V$。然后：
+        </p>
+        $$A = \mathrm{softmax}\left(\frac{QK^\top}{\sqrt{d_k}} + M\right), \quad O = AV$$
+        <p>
+            直白地说：每个 token 用自己的查询去和所有 token 的键做点积，得到相关程度的打分；除以 $\sqrt{d_k}$ 是为了让数值不至于太大；$M$ 是因果掩码，未来位置设为负无穷，保证每个 token 只能看到它之前的内容；softmax 把打分变成加起来等于 1 的权重；最后用这些权重对所有值向量加权求和，得到输出。
+        </p>
+        <p>
+            问题在于，$n$ 个 token 两两之间都要打分，计算量是 $O(n^2)$。上下文长度翻倍，这部分计算翻四倍。
+        </p>
+
+        <h3>5. 标称长度不等于有效长度</h3>
+        <p>
+            模型宣称支持多长的上下文，不代表它真能用好这么长的内容。幻灯片引用了 Greg Kamradt 在 2023 年对 GPT-4 做的"大海捞针"测试：在一段很长的文字的不同位置藏一句关键信息，再问模型这个信息。结果显示，信息放在某些位置、或者上下文很长时，模型找不到它。
+        </p>
+    </section>
+
+    <section>
+        <h2>三、为长上下文设计的模型结构</h2>
+
+        <h3>1. 基本思路：局部计算为主，定期全局查看</h3>
+        <p>
+            标准注意力是全局的，每个 token 都和整个序列做比较。另一种做法是局部计算：每个 token 只看附近固定数量 $w$ 个 token，计算量从 $O(n^2)$ 降到 $O(wn)$，当 $w$ 固定时是线性的。但只看局部会丢失远处的信息。
+        </p>
+        <p>
+            现在的长上下文模型普遍采用混合结构：连续若干层做便宜的局部计算，然后插一层能访问完整历史的全局计算，如此重复。幻灯片列出了几个 2026 年的模型，局部层和全局层的比例大多在 3:1 到 5:1 之间：
+        </p>
+        <table>
+            <tr><th>模型</th><th>局部 / 状态计算</th><th>全局计算</th><th>局部 : 全局</th></tr>
+            <tr><td>Qwen3.8-Flash-Next</td><td>Gated DeltaNet</td><td>QSA 稀疏检索</td><td>36:12 ≈ 3:1</td></tr>
+            <tr><td>GLM-5.3-Flash</td><td>Kimi Delta Attention</td><td>DSA + IndexPool</td><td>34:11 ≈ 3:1</td></tr>
+            <tr><td>Kimi K3</td><td>Kimi Delta Attention</td><td>稠密 Gated MLA</td><td>69:24 ≈ 3:1</td></tr>
+            <tr><td>Nemotron 3 Ultra</td><td>Mamba-2</td><td>稠密 GQA</td><td>48:12 = 4:1</td></tr>
+            <tr><td>Inkling-Small</td><td>512 token 窗口</td><td>稠密 GQA</td><td>35:7 = 5:1</td></tr>
+            <tr><td>DeepSeek-V4-Pro-0813</td><td>128 token 窗口分支</td><td>压缩稀疏 / 稠密交替分支</td><td>交替</td></tr>
+        </table>
+        <p>
+            这些结构用到了四种反复出现的机制：滑动窗口注意力、线性注意力或循环模型、稀疏注意力、KV 压缩。下面逐个说明。
+        </p>
+
+        <h3>2. 滑动窗口注意力</h3>
+        <p>
+            注意力公式不变，只改掩码：第 $i$ 个位置只能看到第 $i-w+1$ 到第 $i$ 个位置，窗口外的都设为负无穷。计算量从 $O(n^2)$ 降到 $O(nw)$。代价是这一层没法直接取到远处的 token。这种做法见于 Longformer（Beltagy 等，2020）。
+        </p>
+
+        <h3>3. 从 softmax 注意力到线性注意力，再到 Delta 规则</h3>
+        <p>
+            这一部分是本讲数学最多的地方，课程按五步演进来讲，每一步只改一处。
+        </p>
+        <p>
+            第一步，标准 softmax 注意力。第 $t$ 步的输出是：
+        </p>
+        $$a_{ti} = \frac{\exp(q_t^\top k_i/\sqrt{d_k})}{\sum_{j=1}^{t}\exp(q_t^\top k_j/\sqrt{d_k})}, \quad o_t = \sum_{i=1}^{t} a_{ti} v_i$$
+        <p>
+            它要保留之前每一个 token 的 $k_i, v_i$，缓存随长度增长，每解码一步要做 $t$ 次比较。
+        </p>
+        <p>
+            第二步，线性注意力（Katharopoulos 等，ICML 2020，论文标题是 Transformers are RNNs）。把 softmax 权重换成简单的点积 $q_t^\top k_i$，就可以交换求和顺序：
+        </p>
+        $$o_t = \sum_{i=1}^{t} (q_t^\top k_i) v_i = \Big(\sum_{i=1}^{t} v_i k_i^\top\Big) q_t = S_t^\top q_t$$
+        <p>
+            括号里的部分可以记成一个固定大小的矩阵 $S_t$，并且可以递推更新：$S_t = S_{t-1} + k_t v_t^\top$。这样不管历史多长，模型只需要保存这一个矩阵，像循环神经网络一样逐步更新。问题是每次都是往里"加"，旧的信息不会被擦掉，不同内容会互相干扰。
+        </p>
+        <p>
+            第三步，DeltaNet（Schlag 等，ICML 2021）。写入前先用当前记忆预测一下 $k_t$ 对应的值 $\hat v_t = S_{t-1}^\top k_t$，算出误差 $e_t = v_t - \hat v_t$，只把误差写进去：
+        </p>
+        $$S_t = S_{t-1} + \beta_t k_t e_t^\top$$
+        <p>
+            $\beta_t$ 在 0 到 1 之间，控制修正力度。这样只沿着 $k_t$ 的方向修正，和它无关的记忆保持不变。
+        </p>
+        <p>
+            第四步，Gated DeltaNet（Yang 等，2024）。在修正之前，先把整个记忆乘一个衰减系数 $\alpha_t$（0 到 1 之间），让旧信息整体淡化：$\tilde S_{t-1} = \alpha_t S_{t-1}$。$\alpha_t$ 管整体保留多少，$\beta_t$ 管针对性修改多少。$\alpha_t = 1$ 时就退回 DeltaNet。
+        </p>
+        <p>
+            第五步，Kimi Delta Attention（KDA，Kimi 团队 2025）。把单个衰减系数换成一个向量，每个特征维度有自己的衰减速度，有的信息记得久，有的忘得快：
+        </p>
+        $$S_t = (I - \beta_t k_t k_t^\top) D_t S_{t-1} + \beta_t k_t v_t^\top, \quad D_t = \mathrm{Diag}(\alpha_t)$$
+        <p>
+            所有维度衰减速度相同时，KDA 就退回 Gated DeltaNet。
+        </p>
+
+        <h3>4. 稀疏注意力</h3>
+        <p>
+            稀疏注意力让每个查询只看一部分键，再在这部分里做 softmax。有两种选法。固定模式与输入无关，比如"附近窗口内的位置，加上几个固定的全局位置"，成本可预测，但不能根据查询内容调整（Longformer 采用这种）。内容相关模式由一个学出来的选择器 $g$ 给每个键打分，挑出分数最高的 $K$ 个（DeepSeek Sparse Attention，2025），能按需检索，但选择器选错了，相关的键就被漏掉。
+        </p>
+
+        <h3>5. KV 压缩</h3>
+        <p>
+            另一条路是减小缓存本身。GQA（Ainslie 等，2023）让多个注意力头共用一组 K、V。MLA（DeepSeek-V2，2024）更进一步：缓存里只存一个低维的潜在向量 $c_t^{KV} = W^{D} z_t$，用的时候再通过每个头各自的矩阵还原出这个头的 K 和 V：$k_t^{(h)} = W^{UK(h)} c_t^{KV}$，$v_t^{(h)} = W^{UV(h)} c_t^{KV}$。
+        </p>
+    </section>
+
+    <section>
+        <h2>四、怎样训练长上下文模型</h2>
+
+        <h3>1. 由短到长的训练流程</h3>
+        <p>
+            长文本数据少、训练贵，所以通常分三段：先用 4K 到 8K 的短序列做预训练，数据多、成本低；再用长文档和拼接序列做继续训练，拉到 32K 到 128K；最后用任务轨迹和合成课程做长度适配，达到 128K 以上。
+        </p>
+
+        <h3>2. 位置编码：模型怎么知道 token 的顺序</h3>
+        <p>
+            注意力本身不区分顺序，把输入打乱，结果只是跟着重新排列。所以需要位置编码告诉模型每个 token 在第几位。位置编码的选择，直接决定模型能不能处理比训练时更长的文本。
+        </p>
+        <ul>
+            <li>绝对位置编码：给第 $t$ 个位置一个向量 $p_t$，加到词向量上：$z_t = E[x_t] + p_t$。可以是学出来的固定大小的表，也可以用正弦函数算出来：$p_{t,2\ell} = \sin(t/\omega_\ell)$，$p_{t,2\ell+1} = \cos(t/\omega_\ell)$，$\omega_\ell = 10000^{2\ell/d}$。</li>
+            <li>旋转位置编码（RoPE，Su 等）：不加向量，而是把 $Q$ 和 $K$ 的每一对维度按位置旋转一个角度，$\tilde q_i = R(i) q_i$，$\tilde k_j = R(j) k_j$。两者点积时，旋转会抵消成 $q_i^\top R(j-i) k_j$，打分只取决于两个 token 的相对距离。$V$ 不变。</li>
+            <li>无位置编码（NoPE，Kazemnejad 等，NeurIPS 2023）：什么都不加，靠因果掩码或循环结构本身隐含的顺序。这样就不存在"超出训练长度的位置没见过"的问题，但仍然需要训练模型掌握长距离的行为。Kimi K3 用 NoPE 加循环的 KDA。</li>
+        </ul>
+
+        <h3>3. 让 RoPE 支持更长的上下文</h3>
+        <p>
+            如果模型用 RoPE 训练到长度 $L$，直接用到更长的 $L'$，会出现训练时没见过的旋转角度。位置插值（Chen 等，2023）的做法是把位置按比例缩小：$R(t) \to R(t/s)$，$s = L'/L$。这样长位置的角度仍落在训练见过的范围内。
+        </p>
+        <p>
+            YaRN（Peng 等，ICLR 2024）改进了这一点。RoPE 的不同维度旋转速度不同：转得慢的维度（长波长）负责远距离位置，完全插值；转得快的维度（短波长）负责区分相邻 token，保持不变，否则近处的细节会被搞乱；中间的维度混合处理。YaRN 还调整了注意力温度，抵消长度扩展后注意力分布变得过于平均的问题。幻灯片提醒，温度公式 $\sqrt{1/\tau} = 0.1\ln s + 1$ 是在 LLaMA 模型上拟合出来的经验配方，不是通用常数。
+        </p>
+
+        <h3>4. 各家模型的做法</h3>
+        <table>
+            <tr><th>模型</th><th>长度训练</th><th>位置方法</th><th>如何达到最大长度</th></tr>
+            <tr><td>Qwen3.8-Flash-Next</td><td>原生 262K</td><td>部分 RoPE</td><td>YaRN 扩展到 1M</td></tr>
+            <tr><td>DeepSeek V4</td><td>4K → 16K → 64K → 1M</td><td>部分 RoPE</td><td>逐步训练 + YaRN</td></tr>
+            <tr><td>GLM-5.3-Flash</td><td>原生 1M</td><td>主注意力用 NoPE</td><td>无需缩放 RoPE</td></tr>
+            <tr><td>Kimi K3</td><td>8K → 64K → 256K → 1M</td><td>NoPE</td><td>逐步训练到 1M</td></tr>
+            <tr><td>Nemotron 3 Ultra</td><td>1M 长上下文继续预训练，SFT 到 512K</td><td>Mamba 隐含顺序</td><td>在长度上直接训练和评估</td></tr>
+        </table>
+
+        <h3>5. 长上下文数据</h3>
+        <p>
+            数据有四种来源：长文档（书、代码库、多文档语料），结构自然连贯；拼接样本，把多条短数据拼成长序列，利用率高，但要处理好边界，防止不同样本之间互相泄露信息；Agent 轨迹，包含动作和观测，能教会模型长程恢复、状态跟踪和工具使用；合成任务，可以把证据和干扰信息放在设计好的位置上。
+        </p>
+        <p>
+            幻灯片比较了 Kimi K3、GLM-5、Nemotron 3 Ultra、DeepSeek V4 的数据配方，总结出共同点：连贯的长文本来源，加上答案依赖远处证据的任务，加上逐步增加的长度。
+        </p>
+
+        <h3>6. 上下文并行</h3>
+        <p>
+            序列长到一张卡放不下时，可以把序列切成 $P$ 段分给 $P$ 张卡，每张卡的内存降为 $O(nd_k/P)$。各卡在计算自己那块注意力的同时，把 K、V 沿环形传给下一张卡，通信和计算重叠进行。总计算量仍是 $O(n^2 d_k)$，结果是精确的，不是稀疏近似。代表方法是 Ring Attention（Liu 等，2023）和 Megatron 的上下文并行。
+        </p>
+    </section>
+
+    <section>
+        <h2>五、提示缓存与 KV 缓存复用</h2>
+
+        <h3>1. Agent 的每次调用都共享前缀</h3>
+        <p>
+            Agent 第 2 次调用的输入，就是第 1 次的输入加上第 1 次的输出和工具结果。所以前面的部分完全一样，已经算过的 KV 缓存可以直接复用，只需要对新增部分做预填充。随着循环推进，可复用的前缀越来越长。这一思路见于 Prompt Cache（Gim 等，MLSys 2024）。
+        </p>
+        <p>
+            实测上，Prompt Cache 发现重新计算的开销增长得比加载缓存快，交叉点取决于硬件。2026 年的论文 Can I Buy Your KV Cache? 指出，一次性的预填充成本可以分摊给多次读取，每次调用的成本会逼近复用那一步的下限。课程也提醒：实际物理成本和服务商的 API 定价是两回事。
+        </p>
+
+        <h3>2. 缓存命中的价格差</h3>
+        <table>
+            <tr><th>模型</th><th>缓存命中输入</th><th>普通输入</th><th>输出</th></tr>
+            <tr><td>DeepSeek V4 Flash</td><td>0.007 到 0.014</td><td>0.22 到 0.44</td><td>0.66 到 1.32</td></tr>
+            <tr><td>GLM-5.2</td><td>0.26</td><td>1.40</td><td>4.40</td></tr>
+            <tr><td>Kimi K3</td><td>0.30</td><td>3.00</td><td>15.00</td></tr>
+            <tr><td>GPT-5.6 Luna</td><td>0.02</td><td>0.20</td><td>1.20</td></tr>
+            <tr><td>GPT-5.6 Sol</td><td>0.40</td><td>4.00</td><td>20.00</td></tr>
+            <tr><td>Claude Opus 5</td><td>0.50</td><td>5.00</td><td>25.00</td></tr>
+        </table>
+        <p>
+            单位是每百万 token 的美元价格，查询日期为 2026 年 8 月 30 日。DeepSeek 的区间对应闲时和高峰时段。缓存命中价格普遍只有普通输入的十分之一左右，写入缓存可能另外计费。
+        </p>
+
+        <h3>3. 服务端如何管理缓存</h3>
+        <ul>
+            <li>分页 KV 缓存（vLLM 的 PagedAttention，Kwon 等，SOSP 2023）：把缓存切成固定大小的块，用一张块表记录逻辑位置到物理位置的映射，和操作系统管理虚拟内存的方法相同，避免显存碎片。</li>
+            <li>RadixAttention（SGLang，Zheng 等，2023）：用基数树存储所有请求的前缀。新请求进来时，匹配已有的最长前缀直接复用，只追加后缀；两个请求共享一段前缀时，把节点拆开共享；显存不够时，淘汰最久没用的叶子节点。</li>
+            <li>缓存感知路由（SGLang v0.4）：请求发给哪台机器，要同时考虑哪台机器缓存了最长的匹配前缀和它的排队长度。比如一台机器匹配 18K 但排队 2 个，另一台只匹配 2K 但空闲，路由器按"可复用前缀减去排队惩罚"打分决定。</li>
+        </ul>
+
+        <h3>4. 写提示词时如何照顾缓存</h3>
+        <p>
+            稳定前缀：指令、工具定义、示例放在最前面，保持不变。变化的内容往后追加：新的用户消息和观测结果。避免无谓的变动：在前缀里放时间戳，或者每次调整工具 Schema 的顺序，都会让缓存失效。测量复用情况：关注缓存命中的 token 数、TTFT 和被淘汰的情况。
+        </p>
+        <p>
+            课程也强调，缓存只是省掉了重复的预填充，模型看到的历史长度并没有减少，上下文窗口仍然会被填满。这就引出了最后一个话题。
+        </p>
+    </section>
+
+    <section>
+        <h2>六、上下文压缩（Compaction）</h2>
+
+        <h3>1. 一个例子</h3>
+        <p>
+            压缩前的历史：观测到 CI 任务 30 分钟后超时；动作是查看任务日志；观测到一份 2.4 万行的日志，里面反复出现"address already in use"；动作是设置 <code>--workers=1</code> 重跑；观测到测试通过，日志保存在 <code>/tmp/ci.log</code>。
+        </p>
+        <p>
+            压缩后只剩：目标是修复 CI 超时；原因是端口冲突；已验证 <code>--workers=1</code> 能通过；证据在 <code>/tmp/ci.log</code>。下一步动作是用测试过的 worker 设置提交 PR。
+        </p>
+
+        <h3>2. 把压缩看成状态估计</h3>
+        <p>
+            课程给了一个形式化的描述。完整历史是 $H_t$，压缩器 $\mathcal{C}$ 在 token 预算 $B$ 之内把它变成工作状态 $\hat s_t = \mathcal{C}(H_t; B)$，$|\hat s_t| \le B$。目标是让模型基于压缩状态做出的后续动作，和基于完整历史做出的动作尽量一致：
+        </p>
+        $$p(A_{\text{future}} \mid H_t) \approx p(A_{\text{future}} \mid \hat s_t)$$
+        <p>
+            这里有三个要求：行为保真（后续决策不变）、表示有界（不超过预算）、可恢复（原样保留关键锚点，并保留指向原始证据的链接，需要时能找回来）。
+        </p>
+
+        <h3>3. 哪些内容保留，哪些丢弃</h3>
+        <ul>
+            <li>原样保留：锚点，也就是目标和约束条件；最近的一段历史，也就是正在进行的尝试和刚拿到的结果。</li>
+            <li>编码保留：检查点，包括已做的决定、进度和各种编号。</li>
+            <li>外部存放：证据库。比如 2.4 万行的日志，上下文里只留 3 个失败点、执行的命令和文件路径，完整内容存到外面（MemGPT 的思路）。</li>
+            <li>丢弃：重复内容和已经被取代的旧尝试。</li>
+        </ul>
+
+        <h3>4. 压缩策略要做的四个决定</h3>
+        <ol>
+            <li>何时触发：达到 token 阈值、服务商报告上下文溢出，或者用户手动要求；要给下一次输出预留空间。</li>
+            <li>压缩哪部分：保护开头，压缩较早的中间部分，保留最近的尾部；切分点要落在完整的对话轮次或工具调用边界上，不能把一个调用和它的结果拆开。</li>
+            <li>用什么替换：可读的摘要、结构化的检查点、服务商提供的不透明对象，或者干脆开一个新上下文。</li>
+            <li>失败时怎么办：保持历史不变、重试或重置、保留可搜索的完整历史。</li>
+        </ol>
+        <p>
+            幻灯片提到 Codex、OpenCode、Pi、Hermes、OpenHands 都实现了各自的压缩策略。
+        </p>
+
+        <h3>5. 反复压缩会漂移</h3>
+        <p>
+            每次压缩都以上一次的摘要为基础：$\hat s_{k+1} = \mathcal{C}(\hat s_k \oplus R_k)$，其中 $R_k$ 是新产生的历史。这会导致信息逐步走样。课上的例子：原始历史写的是"使用 CUDA 12.4"，第一次摘要变成"使用 CUDA 12.x"，第二次变成"使用较新的 CUDA"，第三次这个约束就消失了。对策是：锚点原样复制；保留最近的尾部；需要时回去检索原始证据。
+        </p>
+
+        <h3>6. 怎样评估压缩效果</h3>
+        <p>
+            课程建议用"续做"来评估：先在历史里埋下约束、决定和产物，再用实际的压缩策略压缩，然后让 Agent 继续做，观察它后续的决定。指标有四个：状态回忆（约束和编号是否还记得）；任务成功（后续是否做对）；效率（token、延迟、成本）；稳定性（多次压缩后是否仍然可靠）。
+        </p>
+    </section>
+
+    <section>
+        <h2>七、小结</h2>
+        <p>
+            长上下文是一整套系统问题。增长：Agent 循环不断吸收指令、动作和环境观测。推理：预填充、解码、稠密注意力和 KV 内存各有瓶颈。结构：局部、循环、稀疏和压缩机制决定哪些历史仍可访问。缓存：稳定的前缀能省掉重复的预填充，但不会减少模型看到的历史。压缩：要保住意图、精确的任务状态、最近的工作和恢复途径，并用续做测试来评估。
+        </p>
+    </section>
+
+    <footer class="document-footer">
+        <p>CMU 11-768: AI Agents · Fall 2026</p>
+        <nav class="footer-nav">
+            <a href="02_工具调用的机制与接口.html">&larr; 上一讲</a>
+            <a href="index.html">返回主目录</a>
+            <a href="04_技能与记忆.html">下一讲 &rarr;</a>
+        </nav>
+    </footer>
+</article>
+
+</body>
+</html>
