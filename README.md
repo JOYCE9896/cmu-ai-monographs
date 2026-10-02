@@ -1,6 +1,6 @@
 # CMU AI 课程
 
-> 卡内基梅隆大学 2026 年秋季 AI 前沿课程的个人研读笔记。
+> 卡内基梅隆大学 AI 前沿课程的个人研读笔记。
 
 [![GitHub Pages](https://img.shields.io/badge/Reading-GitHub%20Pages-8b261e?style=flat-square&logo=github)](https://joyce9896.github.io/cmu-ai-monographs/)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-204e79?style=flat-square)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
@@ -28,6 +28,7 @@
 
 | 课程 | 主讲 | 关注点 |
 | :--- | :--- | :--- |
+| [11-711: Advanced NLP](https://joyce9896.github.io/cmu-ai-monographs/11-711-Advanced-NLP/) | Sean Welleck | 研究生 NLP 核心课（2026 春，23 讲）：语言模型、Transformer、预训练、微调与解码、检索、多模态、评估、强化学习、Agent、量化、并行、MoE、长序列与推理时扩展 |
 | [11-768: AI Agents](https://joyce9896.github.io/cmu-ai-monographs/11-768-AI-Agents/) | Graham Neubig、Daniel Fried | 基于大语言模型的 Agent：工具、上下文、记忆、规划、SFT 与 RL 训练（课程进行中，已整理 11 讲） |
 
 ---
